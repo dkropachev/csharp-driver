@@ -958,7 +958,7 @@ namespace Cassandra.Connections.Control
 
                 lock (_reconnectLock)
                 {
-                    var _ = Interlocked.CompareExchange(ref _reconnectTask, null, tcs.Task);
+                    Interlocked.CompareExchange(ref _reconnectTask, null, tcs.Task);
                     tcs.TrySetResult(new ReconnectResult(IsShutdown ? null : oldConnection, oldHost, replaced, trigger));
                 }
             }
@@ -978,7 +978,7 @@ namespace Cassandra.Connections.Control
 
                 lock (_reconnectLock)
                 {
-                    var _ = Interlocked.CompareExchange(ref _reconnectTask, null, tcs.Task);
+                    Interlocked.CompareExchange(ref _reconnectTask, null, tcs.Task);
                     tcs.TrySetException(ex);
                 }
             }

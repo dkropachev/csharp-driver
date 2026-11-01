@@ -935,7 +935,10 @@ namespace Cassandra.Connections.Control
 
                 if (!IsShutdown)
                 {
-                    ControlConnection.Logger.Info("ControlConnection reconnected to host {0}", _host.Address);
+                    if (replaced)
+                    {
+                        ControlConnection.Logger.Info("ControlConnection reconnected to host {0}", _host.Address);
+                    }
 
                     // A topology event may have been sent before the new connection
                     // registered for events. Keep ownership until its refresh is scheduled so

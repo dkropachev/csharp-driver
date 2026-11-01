@@ -940,20 +940,23 @@ namespace Cassandra.Connections.Control
                         ControlConnection.Logger.Info("ControlConnection reconnected to host {0}", _host.Address);
                     }
 
-                    // A topology event may have been sent before the new connection
-                    // registered for events. Keep ownership until its refresh is scheduled so
+                    // A replacement may have missed topology events before registering.
+                    // Keep ownership through refresh enqueue even for skipped requests so
                     // scheduling failures can publish a retry and reach every shared caller.
                     await ScheduleHostsRefreshAsync().ConfigureAwait(false);
 
-                    var schedule = _reconnectionPolicy.NewSchedule();
-                    ReconnectRetry retry;
-                    lock (_reconnectLock)
+                    if (replaced)
                     {
-                        retry = TakeScheduledReconnect();
-                        _reconnectionSchedule = schedule;
-                    }
+                        var schedule = _reconnectionPolicy.NewSchedule();
+                        ReconnectRetry retry;
+                        lock (_reconnectLock)
+                        {
+                            retry = TakeScheduledReconnect();
+                            _reconnectionSchedule = schedule;
+                        }
 
-                    retry?.Timer.Dispose();
+                        retry?.Timer.Dispose();
+                    }
                 }
 
                 lock (_reconnectLock)
@@ -1164,6 +1167,11 @@ namespace Cassandra.Connections.Control
             ReconnectTrigger trigger;
             lock (_connectionHandoffLock)
             {
+                if (h.IsUp)
+                {
+                    return;
+                }
+
                 trigger = new ReconnectTrigger(ReferenceEquals(h, _host) ? _connection : null, h);
                 h.Down -= OnHostDown;
             }

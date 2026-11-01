@@ -569,6 +569,14 @@ namespace Cassandra.Tests.Connections.Control
                 scenario.ReleaseRefresh.TrySetResult(true);
                 await first.WaitToCompleteAsync(5000).ConfigureAwait(false);
                 await scenario.RecoveryCompleted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                if (hostDown)
+                {
+                    var result = scenario.Owner.GetType().GetProperty("Result").GetValue(scenario.Owner);
+                    var successor = (Task)result.GetType().GetProperty("FollowUp").GetValue(result);
+                    Assert.IsNotNull(successor);
+                    await successor.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                }
+
                 Assert.AreEqual(3, scenario.Connections.Count);
 
                 // Invoke the real request loop with the original completed admission, after its successor
@@ -584,6 +592,94 @@ namespace Cassandra.Tests.Connections.Control
             }
             finally
             {
+                await scenario.DrainAsync().ConfigureAwait(false);
+            }
+        }
+
+        [Test]
+        public async Task Should_IgnoreDispatchedHostDown_AfterSameHostRecovers_WithoutRemovingSubscription()
+        {
+            var scenario = new StartupReconnectScenario(this, true, true);
+            try
+            {
+                var downEvent = typeof(Host).GetField("Down", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                var host = scenario.Control.Host;
+                var dispatched = (Action<Host>)downEvent.GetValue(host);
+                Assert.IsNotNull(dispatched);
+                await scenario.FailRegistrationAsync(true).ConfigureAwait(false);
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await scenario.Owner.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreSame(host, scenario.Control.Host);
+                Assert.IsTrue(host.IsUp);
+                var subscriptions = downEvent.GetValue(host);
+                Assert.IsNotNull(subscriptions);
+                var attempts = scenario.ConnectionAttempts;
+
+                dispatched(host);
+
+                Assert.AreEqual(attempts, scenario.ConnectionAttempts);
+                Assert.AreEqual(subscriptions, downEvent.GetValue(host));
+                scenario.HoldNextRefresh();
+                Assert.IsTrue(host.SetDown());
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                var recovery = GetSharedReconnect(scenario.Control);
+                Assert.IsNotNull(recovery);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await recovery.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
+                Assert.IsTrue(host.IsUp);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+            }
+            finally
+            {
+                await scenario.DrainAsync().ConfigureAwait(false);
+            }
+        }
+
+        [Test]
+        public async Task Should_PreservePendingRetryAndSchedule_When_ObsoleteRequestSkipsRetainedConnection()
+        {
+            var scenario = new StartupReconnectScenario(this, false, true, reconnectionPolicy: new FixedReconnectionPolicy(1000, 2000));
+            try
+            {
+                await scenario.FailRegistrationAsync(false).ConfigureAwait(false);
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await scenario.Owner.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                var retained = scenario.Connections.Last().Object;
+                scenario.FailOpen = true;
+                await Assert.ThrowsAsync<NoHostAvailableException>(() =>
+                    scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
+                var attempts = scenario.ConnectionAttempts;
+                var retry = scenario.Timers.Single();
+                var scheduleField = typeof(ControlConnection).GetField(
+                    "_reconnectionSchedule", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                var schedule = scheduleField.GetValue(scenario.Control);
+                retry.Timer.Verify(value => value.Change(TimeSpan.FromMilliseconds(1000), Timeout.InfiniteTimeSpan), Times.Once);
+
+                await scenario.Control.Reconnect(scenario.Connections.First().Object).WaitToCompleteAsync(5000).ConfigureAwait(false);
+
+                Assert.AreEqual(attempts, scenario.ConnectionAttempts);
+                Assert.IsFalse(retained.IsDisposed);
+                retry.Timer.Verify(value => value.Dispose(), Times.Never);
+                Assert.AreSame(schedule, scheduleField.GetValue(scenario.Control));
+                scenario.FailOpen = false;
+                scenario.HoldNextRefresh();
+                retry.Fire();
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                var recovery = GetSharedReconnect(scenario.Control);
+                Assert.IsNotNull(recovery);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await recovery.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
+                Assert.IsTrue(retained.IsDisposed);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+                retry.Timer.Verify(value => value.Dispose(), Times.Once);
+            }
+            finally
+            {
+                scenario.FailOpen = false;
                 await scenario.DrainAsync().ConfigureAwait(false);
             }
         }
@@ -2439,7 +2535,8 @@ namespace Cassandra.Tests.Connections.Control
             private int _connectionNumber;
 
             public StartupReconnectScenario(
-                ControlConnectionTests fixture, bool sameHost, bool replacementUp, bool closeBeforeAdmission = false)
+                ControlConnectionTests fixture, bool sameHost, bool replacementUp, bool closeBeforeAdmission = false,
+                IReconnectionPolicy reconnectionPolicy = null)
             {
                 _closeBeforeAdmission = closeBeforeAdmission;
                 var ready = ReadyResponse.Create(new Frame(
@@ -2565,7 +2662,7 @@ namespace Cassandra.Tests.Connections.Control
                         builder.ServerEventsSubscriber = new ServerEventsSubscriber();
                         builder.SchemaParserFactory = schemaFactory.Object;
                         builder.TimerFactory = new TaskBasedTimerFactory(CaptureReconnectTimers(Timers));
-                        builder.Policies = new Cassandra.Policies(policy, new ConstantReconnectionPolicy(1000), new DefaultRetryPolicy());
+                        builder.Policies = new Cassandra.Policies(policy, reconnectionPolicy ?? new ConstantReconnectionPolicy(1000), new DefaultRetryPolicy());
                     },
                     contactPointsFactory: config => new[]
                     {

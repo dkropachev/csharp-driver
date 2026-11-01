@@ -597,7 +597,7 @@ namespace Cassandra.Tests.Connections.Control
         }
 
         [Test]
-        public async Task Should_IgnoreDispatchedHostDown_AfterSameHostRecovers_WithoutRemovingSubscription()
+        public async Task Should_IgnoreDispatchedHostDown_OnlyForHealthyCurrentConnection_WithoutRemovingSubscription()
         {
             var scenario = new StartupReconnectScenario(this, true, true);
             try
@@ -620,6 +620,34 @@ namespace Cassandra.Tests.Connections.Control
 
                 Assert.AreEqual(attempts, scenario.ConnectionAttempts);
                 Assert.AreEqual(subscriptions, downEvent.GetValue(host));
+
+                var retained = scenario.Connections.Last().Object;
+                retained.Dispose();
+                scenario.FailOpen = true;
+                await Assert.ThrowsAsync<NoHostAvailableException>(() =>
+                    scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
+                scenario.FailOpen = false;
+                Assert.IsTrue(host.IsUp);
+                Assert.IsTrue(retained.IsDisposed);
+                var retry = scenario.Timers.Single();
+                retry.Timer.Verify(value => value.Dispose(), Times.Never);
+                attempts = scenario.ConnectionAttempts;
+                scenario.HoldNextRefresh();
+
+                dispatched(host);
+
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                var recoveryFromDisposed = GetSharedReconnect(scenario.Control);
+                Assert.IsNotNull(recoveryFromDisposed);
+                retry.Timer.Verify(value => value.Dispose(), Times.Never);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await recoveryFromDisposed.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreSame(retained, GetHandledConnection(recoveryFromDisposed));
+                Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
+                Assert.AreNotSame(retained, scenario.Connections.Last().Object);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+                retry.Timer.Verify(value => value.Dispose(), Times.Once);
+                attempts = scenario.ConnectionAttempts;
                 scenario.HoldNextRefresh();
                 Assert.IsTrue(host.SetDown());
                 await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
@@ -633,6 +661,7 @@ namespace Cassandra.Tests.Connections.Control
             }
             finally
             {
+                scenario.FailOpen = false;
                 await scenario.DrainAsync().ConfigureAwait(false);
             }
         }
@@ -2535,7 +2564,10 @@ namespace Cassandra.Tests.Connections.Control
             private int _connectionNumber;
 
             public StartupReconnectScenario(
-                ControlConnectionTests fixture, bool sameHost, bool replacementUp, bool closeBeforeAdmission = false,
+                ControlConnectionTests fixture,
+                bool sameHost,
+                bool replacementUp,
+                bool closeBeforeAdmission = false,
                 IReconnectionPolicy reconnectionPolicy = null)
             {
                 _closeBeforeAdmission = closeBeforeAdmission;

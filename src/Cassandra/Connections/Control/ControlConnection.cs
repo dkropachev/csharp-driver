@@ -1167,7 +1167,7 @@ namespace Cassandra.Connections.Control
             ReconnectTrigger trigger;
             lock (_connectionHandoffLock)
             {
-                if (h.IsUp)
+                if (h.IsUp && ReferenceEquals(h, _host) && !(_connection?.IsDisposed ?? true))
                 {
                     return;
                 }

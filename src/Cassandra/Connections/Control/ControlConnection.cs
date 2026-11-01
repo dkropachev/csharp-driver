@@ -121,6 +121,11 @@ namespace Cassandra.Connections.Control
             await Connect(true).ConfigureAwait(false);
         }
 
+        private static bool IsConnectionOpen(IConnection connection)
+        {
+            return connection != null && !connection.IsDisposed && !connection.IsClosed;
+        }
+
         /// <summary>
         /// Resolves the contact points to a read only list of <see cref="IConnectionEndPoint"/> which will be used
         /// during initialization. Also sets <see cref="Metadata.SetResolvedContactPoints"/>.
@@ -830,7 +835,7 @@ namespace Cassandra.Connections.Control
                         ? !result.Replaced
                         : !trigger.Matches(result.Connection, result.Host) &&
                           !trigger.Matches(result.Cause.Connection, result.Cause.Host) &&
-                          ((_connection?.IsDisposed ?? true) ||
+                          (!IsConnectionOpen(_connection) ||
                            (trigger.Host != null && !(_host?.IsUp ?? false))));
                 }
 
@@ -901,7 +906,7 @@ namespace Cassandra.Connections.Control
                         skip = !trigger.IsForced &&
                                (!ReferenceEquals(trigger.Connection, oldConnection) ||
                                 (trigger.Host != null && !ReferenceEquals(trigger.Host, oldHost))) &&
-                               !(oldConnection?.IsDisposed ?? true) && (oldHost?.IsUp ?? false);
+                               IsConnectionOpen(oldConnection) && (oldHost?.IsUp ?? false);
                         if (skip)
                         {
                             oldConnection = trigger.Connection;
@@ -1169,7 +1174,7 @@ namespace Cassandra.Connections.Control
             ReconnectTrigger trigger;
             lock (_connectionHandoffLock)
             {
-                if (h.IsUp && ReferenceEquals(h, _host) && !(_connection?.IsDisposed ?? true))
+                if (h.IsUp && ReferenceEquals(h, _host) && IsConnectionOpen(_connection))
                 {
                     return;
                 }

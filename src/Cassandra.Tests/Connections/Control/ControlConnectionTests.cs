@@ -596,8 +596,9 @@ namespace Cassandra.Tests.Connections.Control
             }
         }
 
-        [Test]
-        public async Task Should_IgnoreDispatchedHostDown_OnlyForHealthyCurrentConnection_WithoutRemovingSubscription()
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task Should_IgnoreDispatchedHostDown_OnlyForHealthyCurrentConnection_WithoutRemovingSubscription(bool closedFallback)
         {
             var scenario = new StartupReconnectScenario(this, true, true);
             try
@@ -622,13 +623,23 @@ namespace Cassandra.Tests.Connections.Control
                 Assert.AreEqual(subscriptions, downEvent.GetValue(host));
 
                 var retained = scenario.Connections.Last().Object;
-                retained.Dispose();
+                if (!closedFallback)
+                {
+                    retained.Dispose();
+                }
+
                 scenario.FailOpen = true;
                 await Assert.ThrowsAsync<NoHostAvailableException>(() =>
                     scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
                 scenario.FailOpen = false;
+                if (closedFallback)
+                {
+                    retained.Close();
+                }
+
                 Assert.IsTrue(host.IsUp);
-                Assert.IsTrue(retained.IsDisposed);
+                Assert.IsTrue(retained.IsClosed);
+                Assert.AreEqual(!closedFallback, retained.IsDisposed);
                 var retry = scenario.Timers.Single();
                 retry.Timer.Verify(value => value.Dispose(), Times.Never);
                 attempts = scenario.ConnectionAttempts;
@@ -637,15 +648,16 @@ namespace Cassandra.Tests.Connections.Control
                 dispatched(host);
 
                 await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
-                var recoveryFromDisposed = GetSharedReconnect(scenario.Control);
-                Assert.IsNotNull(recoveryFromDisposed);
+                var recoveryFromFallback = GetSharedReconnect(scenario.Control);
+                Assert.IsNotNull(recoveryFromFallback);
                 retry.Timer.Verify(value => value.Dispose(), Times.Never);
                 scenario.ReleaseRefresh.TrySetResult(true);
-                await recoveryFromDisposed.WaitToCompleteAsync(5000).ConfigureAwait(false);
-                Assert.AreSame(retained, GetHandledConnection(recoveryFromDisposed));
+                await recoveryFromFallback.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreSame(retained, GetHandledConnection(recoveryFromFallback));
                 Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
                 Assert.AreNotSame(retained, scenario.Connections.Last().Object);
                 Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsClosed);
                 retry.Timer.Verify(value => value.Dispose(), Times.Once);
                 attempts = scenario.ConnectionAttempts;
                 scenario.HoldNextRefresh();
@@ -658,6 +670,55 @@ namespace Cassandra.Tests.Connections.Control
                 Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
                 Assert.IsTrue(host.IsUp);
                 Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsClosed);
+            }
+            finally
+            {
+                scenario.FailOpen = false;
+                await scenario.DrainAsync().ConfigureAwait(false);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task Should_ReplaceClosedFallback_ForObsoleteOrDelayedRequests(bool delayed)
+        {
+            var scenario = new StartupReconnectScenario(this, false, true);
+            try
+            {
+                await scenario.FailRegistrationAsync(false).ConfigureAwait(false);
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await scenario.Owner.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                var retained = scenario.Connections.Last().Object;
+                scenario.FailOpen = true;
+                await Assert.ThrowsAsync<NoHostAvailableException>(() =>
+                    scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
+                scenario.FailOpen = false;
+                retained.Close();
+                Assert.IsTrue(retained.IsClosed);
+                Assert.IsFalse(retained.IsDisposed);
+                Assert.IsTrue(scenario.Control.Host.IsUp);
+                var retry = scenario.Timers.Single();
+                var attempts = scenario.ConnectionAttempts;
+                scenario.HoldNextRefresh();
+
+                var request = delayed
+                    ? ResumeReconnectRequest(scenario.Control, scenario.Owner, retained, null)
+                    : scenario.Control.Reconnect(scenario.Connections.First().Object);
+
+                await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreEqual(attempts + 1, scenario.ConnectionAttempts);
+                Assert.IsFalse(request.IsCompleted);
+                retry.Timer.Verify(value => value.Dispose(), Times.Never);
+                scenario.ReleaseRefresh.TrySetResult(true);
+                await request.WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreSame(retained, GetHandledConnection(request));
+                Assert.IsTrue(retained.IsDisposed);
+                Assert.AreNotSame(retained, scenario.Connections.Last().Object);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
+                Assert.IsFalse(scenario.Connections.Last().Object.IsClosed);
+                retry.Timer.Verify(value => value.Dispose(), Times.Once);
             }
             finally
             {
@@ -2586,12 +2647,22 @@ namespace Cassandra.Tests.Connections.Control
                     }
 
                     var disposed = false;
+                    var closed = false;
                     var connection = new Mock<IConnection>();
                     connection.SetupGet(value => value.EndPoint).Returns(endPoint);
                     connection.SetupGet(value => value.IsDisposed).Returns(() => Volatile.Read(ref disposed));
-                    connection.Setup(value => value.Dispose()).Callback(() => Volatile.Write(ref disposed, true));
+                    connection.SetupGet(value => value.IsClosed).Returns(() => Volatile.Read(ref closed));
+                    connection.Setup(value => value.Dispose()).Callback(() =>
+                    {
+                        Volatile.Write(ref closed, true);
+                        Volatile.Write(ref disposed, true);
+                    });
                     connection.Setup(value => value.Close())
-                        .Callback(() => connection.Raise(value => value.Closing += null, connection.Object));
+                        .Callback(() =>
+                        {
+                            Volatile.Write(ref closed, true);
+                            connection.Raise(value => value.Closing += null, connection.Object);
+                        });
                     connection.Setup(value => value.Open()).Returns(() => FailOpen
                         ? Task.FromException<Response>(new SocketException((int)SocketError.ConnectionRefused))
                         : Task.FromResult<Response>(null));

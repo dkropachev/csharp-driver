@@ -34,6 +34,8 @@ namespace Cassandra.Connections.Control
     {
         private const int StateRunning = 0;
         private const int StateDisposed = 1;
+
+        // System timers support at most uint.MaxValue - 1 milliseconds of due time.
         private const long MaxReconnectDelayMs = 4294967294L;
 
         private readonly IInternalCluster _cluster;

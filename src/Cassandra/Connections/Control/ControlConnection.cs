@@ -1081,7 +1081,6 @@ namespace Cassandra.Connections.Control
                 }
 
                 await _metadata.RebuildTokenMapAsync(false, _config.MetadataSyncOptions.MetadataSyncEnabled).ConfigureAwait(false);
-                _reconnectionSchedule = _reconnectionPolicy.NewSchedule();
             }
             catch (SocketException ex)
             {

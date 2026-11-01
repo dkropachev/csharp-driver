@@ -743,9 +743,6 @@ namespace Cassandra.Tests.Connections.Control
                     scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
                 var attempts = scenario.ConnectionAttempts;
                 var retry = scenario.Timers.Single();
-                var scheduleField = typeof(ControlConnection).GetField(
-                    "_reconnectionSchedule", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                var schedule = scheduleField.GetValue(scenario.Control);
                 retry.Timer.Verify(value => value.Change(TimeSpan.FromMilliseconds(1000), Timeout.InfiniteTimeSpan), Times.Once);
 
                 await scenario.Control.Reconnect(scenario.Connections.First().Object).WaitToCompleteAsync(5000).ConfigureAwait(false);
@@ -753,10 +750,23 @@ namespace Cassandra.Tests.Connections.Control
                 Assert.AreEqual(attempts, scenario.ConnectionAttempts);
                 Assert.IsFalse(retained.IsDisposed);
                 retry.Timer.Verify(value => value.Dispose(), Times.Never);
-                Assert.AreSame(schedule, scheduleField.GetValue(scenario.Control));
+                var refresh = scenario.LastQueuedEvent;
+                Assert.IsNotNull(refresh);
+                await refresh.Handler().WaitToCompleteAsync(5000).ConfigureAwait(false);
+                Assert.AreEqual(attempts, scenario.ConnectionAttempts);
+                retry.Timer.Verify(value => value.Dispose(), Times.Never);
+
+                await Assert.ThrowsAsync<NoHostAvailableException>(() =>
+                    scenario.Control.Reconnect(null).WaitToCompleteAsync(5000)).ConfigureAwait(false);
+                Assert.AreEqual(2, scenario.Timers.Count);
+                var nextRetry = scenario.Timers.Last();
+                nextRetry.Timer.Verify(value => value.Change(TimeSpan.FromMilliseconds(2000), Timeout.InfiniteTimeSpan), Times.Once);
+                retry.Timer.Verify(value => value.Dispose(), Times.Once);
+                nextRetry.Timer.Verify(value => value.Dispose(), Times.Never);
+                attempts = scenario.ConnectionAttempts;
                 scenario.FailOpen = false;
                 scenario.HoldNextRefresh();
-                retry.Fire();
+                nextRetry.Fire();
                 await scenario.RefreshStarted.Task.WaitToCompleteAsync(5000).ConfigureAwait(false);
                 var recovery = GetSharedReconnect(scenario.Control);
                 Assert.IsNotNull(recovery);
@@ -766,6 +776,7 @@ namespace Cassandra.Tests.Connections.Control
                 Assert.IsTrue(retained.IsDisposed);
                 Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
                 retry.Timer.Verify(value => value.Dispose(), Times.Once);
+                nextRetry.Timer.Verify(value => value.Dispose(), Times.Once);
             }
             finally
             {
@@ -2740,6 +2751,7 @@ namespace Cassandra.Tests.Connections.Control
                     .Returns(schemaParser.Object);
                 var debouncer = new Mock<IProtocolEventDebouncer>();
                 debouncer.Setup(value => value.ScheduleEventAsync(It.IsAny<ProtocolEvent>(), false))
+                    .Callback<ProtocolEvent, bool>((protocolEvent, _) => LastQueuedEvent = protocolEvent)
                     .Returns(async () =>
                     {
                         if (Interlocked.Exchange(ref _holdRefresh, 0) == 1)
@@ -2790,6 +2802,8 @@ namespace Cassandra.Tests.Connections.Control
             public TaskCompletionSource<bool> RecoveryStarted { get; } = NewSignal();
 
             public TaskCompletionSource<bool> RecoveryCompleted { get; private set; } = NewSignal();
+
+            public ProtocolEvent LastQueuedEvent { get; private set; }
 
             public ControlConnection Control => _created.ControlConnection;
 

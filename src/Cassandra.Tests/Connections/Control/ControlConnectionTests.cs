@@ -440,6 +440,7 @@ namespace Cassandra.Tests.Connections.Control
             }
         }
 
+        [NonParallelizable]
         [TestCase(false, false, true, 2)]
         [TestCase(true, false, true, 2)]
         [TestCase(true, true, true, 2)]
@@ -448,6 +449,10 @@ namespace Cassandra.Tests.Connections.Control
             bool hostDown, bool sameHost, bool replacementUp, int expectedConnections)
         {
             var scenario = new StartupReconnectScenario(this, sameHost, replacementUp);
+            var listener = new LoggingTests.TestTraceListener();
+            var previousLevel = Diagnostics.CassandraTraceSwitch.Level;
+            Diagnostics.CassandraTraceSwitch.Level = TraceLevel.Info;
+            Trace.Listeners.Add(listener);
             try
             {
                 await scenario.FailRegistrationAsync(hostDown).ConfigureAwait(false);
@@ -457,6 +462,8 @@ namespace Cassandra.Tests.Connections.Control
                 await scenario.Owner.WaitToCompleteAsync(5000).ConfigureAwait(false);
                 var expectedHandled = expectedConnections == 2 ? scenario.Connections.First() : scenario.Connections.ElementAt(1);
                 Assert.AreSame(expectedHandled.Object, GetHandledConnection(scenario.Owner));
+                Assert.AreEqual(expectedConnections == 2 ? 0 : 1, listener.Messages.Values.Count(message =>
+                    message.Contains("ControlConnection reconnected to host ")));
                 Assert.IsFalse(scenario.Connections.Last().Object.IsDisposed);
                 if (expectedConnections == 2)
                 {
@@ -467,7 +474,15 @@ namespace Cassandra.Tests.Connections.Control
             }
             finally
             {
-                await scenario.DrainAsync().ConfigureAwait(false);
+                try
+                {
+                    await scenario.DrainAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    Trace.Listeners.Remove(listener);
+                    Diagnostics.CassandraTraceSwitch.Level = previousLevel;
+                }
             }
         }
 

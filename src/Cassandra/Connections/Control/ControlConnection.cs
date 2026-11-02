@@ -945,6 +945,11 @@ namespace Cassandra.Connections.Control
                     if (replaced)
                     {
                         ControlConnection.Logger.Info("ControlConnection reconnected to host {0}", _host.Address);
+                        var schedule = _reconnectionPolicy.NewSchedule();
+                        lock (_reconnectLock)
+                        {
+                            _reconnectionSchedule = schedule;
+                        }
                     }
 
                     // A replacement may have missed topology events before registering.
@@ -954,12 +959,10 @@ namespace Cassandra.Connections.Control
 
                     if (replaced)
                     {
-                        var schedule = _reconnectionPolicy.NewSchedule();
                         ReconnectRetry retry;
                         lock (_reconnectLock)
                         {
                             retry = TakeScheduledReconnect();
-                            _reconnectionSchedule = schedule;
                         }
 
                         retry?.Timer.Dispose();

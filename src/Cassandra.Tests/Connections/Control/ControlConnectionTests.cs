@@ -1554,7 +1554,7 @@ namespace Cassandra.Tests.Connections.Control
                 {
                     pendingRetry.Timer.Verify(value => value.Dispose(), Times.Never);
                     timers.Last().Timer.Verify(
-                        value => value.Change(TimeSpan.FromMilliseconds(2000), Timeout.InfiniteTimeSpan),
+                        value => value.Change(TimeSpan.FromMilliseconds(failAfterConnect ? 1000 : 2000), Timeout.InfiniteTimeSpan),
                         Times.Once);
                     Volatile.Write(ref allowReconnectSuccess, true);
                     pendingRetry.Fire();
